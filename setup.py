@@ -91,24 +91,84 @@ def build_concorde():
         print("building concorde")
         _run("tar xzvf concorde.tgz", "build")
 
-        cflags = "-fPIC -O2 -g -ansi"
+        # Replace Concorde's prehistoric Autotools helper scripts with
+        # modern ones so that the build recognises contemporary 64-bit
+        # Linux hosts such as x86_64-unknown-linux-gnu.
+        try:
+            autotools_dir = "/usr/share/misc"  # Debian/Ubuntu (autotools-dev)
+            for helper in ("config.guess", "config.sub"):
+                helper_path = os.path.join(autotools_dir, helper)
+                if os.path.exists(helper_path):
+                    shutil.copy(helper_path, f"build/concorde/{helper}")
+        except Exception:
+            # Best-effort; if this fails we fall back to the originals.
+            pass
+
+        # Enable default (glibc) feature macros so legacy networking code
+        # sees e.g. `h_addr` in <netdb.h>, and ensure we build position-
+        # independent code with optimisation and symbols.
+        cflags = "-fPIC -O2 -g -D_DEFAULT_SOURCE"
 
         if platform.system().startswith("Darwin"):
             flags = "--host=darwin"
         else:
+            # Let configure decide the canonical host/build; now that we
+            # ship modern config.guess/config.sub this will succeed and we
+            # avoid cross-compile mode (which had disabled feature tests and
+            # produced wrong prototypes like gethostname).
             flags = ""
 
         datadir = os.path.abspath("data")
         cwd = (
-            'CFLAGS="{cflags}" ./configure --prefix {data} '
+            'CC="gcc" CFLAGS="{cflags}" ./configure --prefix {data} '
             "--with-qsopt={data} {flags}"
-        ).format(cflags=cflags, data=datadir, flags=flags)
+        ).format(cflags=cflags, data=datadir, flags=flags).strip()
 
         _run(cwd, "build/concorde")
-        _run("make", "build/concorde")
+        # Work around obsolete typedef macros that conflict with modern
+        # system headers.  The configure script defines `#define u_char
+        # unsigned char` if it does not detect the BSD typedef from
+        # <sys/types.h>.  On current glibc systems that typedef exists but
+        # configure (running in strict ANSI mode) does not see it, so the
+        # macro redefinition causes a hard error.  We comment it out.
+        cfg_hdr = "build/concorde/INCLUDE/config.h"
+        try:
+            with open(cfg_hdr, "r", encoding="utf-8") as f:
+                cfg_lines = f.readlines()
+            with open(cfg_hdr, "w", encoding="utf-8") as f:
+                for ln in cfg_lines:
+                    if ln.strip().startswith("#define u_char"):
+                        f.write("/* " + ln.strip() + " (removed by setup.py) */\n")
+                    else:
+                        f.write(ln)
+        except Exception:
+            pass
+
+        # Build Concorde library with the flags already recorded in the
+        # generated Makefiles (they now include -D_DEFAULT_SOURCE plus the
+        # required -I paths).  Do not override them here.
+        _run('make', "build/concorde")
 
         shutil.copyfile("build/concorde/concorde.a", "data/concorde.a")
         shutil.copyfile("build/concorde/concorde.h", "data/concorde.h")
+
+        # The 20-year-old Autotools probe can mis-detect the gethostname
+        # prototype with modern glibc (expects `int`, gets `size_t`) and
+        # therefore asks concorde.h to declare its own obsolete version.
+        # That clashes later when we compile the Python extension.  Remove
+        # the stale macro so the duplicate prototype is not emitted.
+        hdr_path = "data/concorde.h"
+        try:
+            with open(hdr_path, "r", encoding="utf-8") as h:
+                lines = h.readlines()
+            with open(hdr_path, "w", encoding="utf-8") as h:
+                for line in lines:
+                    if "#define CC_PROTO_GETHOSTNAME" in line:
+                        h.write("/* " + line.strip() + " (disabled by setup.py) */\n")
+                    else:
+                        h.write(line)
+        except Exception:
+            pass
 
 
 class build_ext(_build_ext, object):
